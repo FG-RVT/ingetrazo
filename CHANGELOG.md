@@ -28,6 +28,16 @@ follow [SemVer](https://semver.org).
   por encima de 18 GB a 32 ms por movimiento y 11,7 GB; con Línea, 71 ms.
   Los modelos normales usan el índice de siempre.
 
+### Corregido
+- **Empujar ya no salta a referencias que no se ven** (#270, #384): la
+  distancia que Push/Pull deduce a mitad de arrastre leía cualquier
+  vértice o arista bajo el cursor, aunque estuviera tapado por geometría o
+  cortado por un plano de sección — la extrusión se lanzaba de pronto a un
+  canto invisible al cruzarlo. Ahora la inferencia aplica las mismas dos
+  reglas que los snaps: lo que la sección corta no se pulsa ni se encaja, y
+  lo que hay delante esconde; en Rayos X y alambre todo sigue siendo
+  referencia, como siempre.
+
 ## [0.5.7] — 2026-09-30
 
 **Ventanas paramétricas, la selección con puntos y una semana de pedidos
