@@ -849,6 +849,18 @@ class PushPullTool(Tool):
             return None
         return self._inference_point, self._inference_kind
 
+    def inference_guide_lines(self):
+        """The «level with that point» reference segment, from the geometry
+        the distance inference locked onto to the moving cap, as
+        ``(reference, moved_anchor, kind)`` — ``[]`` while nothing is
+        engaged."""
+        # The inference point FIRST: the hot-retype replay arms a drag with no
+        # anchor, and the hook must stay [] there, never evaluate anchor math.
+        if self._inference_point is None or not self.dragging:
+            return []
+        moved = self._anchor + self._normal * self.extrusion
+        return [(self._inference_point, moved, self._inference_kind)]
+
     def value_label(self):
         """Return ``(text, midpoint_world)`` for the floating distance label.
         Uses the anchor captured at drag start, which stays fixed even while a

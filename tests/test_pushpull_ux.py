@@ -1678,3 +1678,160 @@ def test_trailing_release_after_double_click_commit_is_no_op():
     assert len(vp.history.undo_stack) == depth    # no double commit
     assert _fingerprint(scene) == before
     assert tool.dragging is False
+
+
+# ---- Dotted inference guide lines during the drag ------------------------------
+#
+# Fix 3: the distance inference pins the push to model geometry and the overlay
+# marks the reference point — but the LEVEL itself, the dotted "level with"
+# line from that reference to where the drag's anchor now sits, was exposed
+# nowhere. The tool says it as observable state: ``inference_guide_lines()``
+# returns exactly one segment ``(reference_point, moved_anchor_point, kind)``
+# while a drag holds an ACTIVE inference — the moved anchor being the drag
+# anchor translated by normal*extrusion — and ``[]`` otherwise (idle, or
+# mid-drag with nothing engaged). ``kind`` is the same string the inference
+# marker carries ("vertex" / "edge" / "face" / …).
+
+
+def _guide_lines(tool):
+    # The hook does not exist yet: it must fail as an INEQUALITY against the
+    # expected value, not blow up as an AttributeError (a vacuous red).
+    fn = getattr(tool, "inference_guide_lines", lambda: ["<missing>"])
+    return fn()
+
+
+def _dist(a: QVector3D, b: QVector3D) -> float:
+    return (a - b).length()
+
+
+class _GuideViewport(_StubViewport):
+    """The vertex-inference stub (_InferViewport) plus the lock-line
+    projection on_hover falls back to when no reference engages: the
+    cursor's (x, z) world point dropped onto the push axis."""
+
+    snap_threshold_px = 9.0
+
+    def _world_to_pixel(self, world):
+        return (world.x() * 10.0, -world.z() * 10.0)
+
+    def _project_to_lock_line(self, start, direction, px, py):
+        d = QVector3D(direction).normalized()
+        cursor = QVector3D(px / 10.0, start.y(), -py / 10.0)
+        return QVector3D(start) + d * QVector3D.dotProduct(cursor - start, d)
+
+
+def test_inference_guide_lines_empty_when_idle():
+    tool = PushPullTool()
+    assert tool.dragging is False                 # no drag, no inference...
+    assert tool.inference_marker() is None
+    assert _guide_lines(tool) == []
+
+
+def test_inference_guide_lines_empty_without_inference():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _GuideViewport(scene)
+    tool = _locked_tool(scene, _top(scene, 3.0), 0.5)
+
+    # Mid-drag over empty space: a real extrusion (cursor (200, -40) reads
+    # +1.0 along the normal) but no vertex near, no edge, no face picked —
+    # the EMPTY result must key on the absent inference, not the drag.
+    tool.on_hover(_px(vp, 200.0, -40.0))
+    assert tool.dragging is True
+    assert abs(tool.extrusion - 1.0) < 1e-6        # the drag is live...
+    assert tool.inference_marker() is None         # ...with nothing engaged
+    assert _guide_lines(tool) == []
+
+
+def test_inference_guide_lines_with_vertex_inference():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)                 # cube A, top z=3
+    other = [V(6, 0, 0), V(8, 0, 0), V(8, 2, 0), V(6, 2, 0)]
+    hist.execute(build_add_edges(
+        scene, [(other[i], other[(i + 1) % 4]) for i in range(4)],
+        detect_faces=False, extra=[AddFaceCommand(list(other))]))
+    ref = next(f for f in scene.faces
+               if all(abs(v.z()) < 1e-9 for v in f.vertices)
+               and min(v.x() for v in f.vertices) >= 5.999)
+    _push(scene, ref, 5.0 if ref.normal().z() > 0 else -5.0)  # block top z=5
+
+    vp = _GuideViewport(scene)
+    tool = _locked_tool(scene, _top(scene, 3.0), 0.5)
+    tool._prism_verts = tool._cap_vertices(scene)  # as a real on_click arms it
+
+    # The real drag path: the cursor on the block's top corner (6, 0, 5).
+    tool.on_hover(_px(vp, 60.0, -50.0))
+    marker = tool.inference_marker()
+    assert marker is not None and marker[1] == "vertex"   # locked onto it
+    assert abs(tool.extrusion - 2.0) < 1e-6        # hover built the extrusion
+
+    guides = _guide_lines(tool)
+    assert len(guides) == 1 and len(guides[0]) == 3
+    reference, moved, kind = guides[0]
+    assert kind == "vertex"
+    assert _dist(reference, V(6, 0, 5)) < 1e-6     # the inferred corner itself
+    # The moved anchor: anchor + normal*extrusion — and since on_hover builds
+    # the extrusion from the inference (the corner projected onto the push
+    # axis), it sits level with the vertex.
+    assert _dist(moved, tool._anchor + tool._normal * tool.extrusion) < 1e-6
+    assert _dist(moved, V(2, 2, 5)) < 1e-6
+
+
+def test_inference_guide_lines_cleared_after_commit():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    other = [V(6, 0, 0), V(8, 0, 0), V(8, 2, 0), V(6, 2, 0)]
+    hist.execute(build_add_edges(
+        scene, [(other[i], other[(i + 1) % 4]) for i in range(4)],
+        detect_faces=False, extra=[AddFaceCommand(list(other))]))
+    ref = next(f for f in scene.faces
+               if all(abs(v.z()) < 1e-9 for v in f.vertices)
+               and min(v.x() for v in f.vertices) >= 5.999)
+    _push(scene, ref, 5.0 if ref.normal().z() > 0 else -5.0)
+
+    vp = _GuideViewport(scene)
+    tool = _locked_tool(scene, _top(scene, 3.0), 0.5)
+    tool._prism_verts = tool._cap_vertices(scene)
+
+    tool.on_hover(_px(vp, 60.0, -50.0))            # vertex inference engaged
+    assert tool.inference_marker() is not None     # the guide line is up
+    tool.on_click(_ctx(vp))                        # the commit click
+
+    assert tool.dragging is False
+    assert _top(scene, 5.0) is not None            # the +2 push landed
+    assert tool.inference_marker() is None
+    assert _guide_lines(tool) == []
+
+
+def test_inference_guide_lines_with_face_inference():
+    # The second kind for free: the on-face fallback stub already makes
+    # _infer_reference_distance engage a face plane, so the guide line must
+    # carry that hit and its own kind.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)                 # cube top z=3
+    ref_loop = [V(20, 20, 7), V(24, 20, 7), V(24, 24, 7), V(20, 24, 7)]
+    hist.execute(build_add_edges(
+        scene, [(ref_loop[i], ref_loop[(i + 1) % 4]) for i in range(4)],
+        detect_faces=False, extra=[AddFaceCommand(list(ref_loop))]))
+    ref = next(f for f in scene.faces
+               if all(abs(v.z() - 7) < 1e-9 for v in f.vertices))
+
+    vp = _FaceInferViewport(scene, ref)
+    tool = _locked_tool(scene, _top(scene, 3.0), 0.5)
+
+    tool.on_hover(_px(vp, 220.0, -70.0))           # the face plane, z=7
+    marker = tool.inference_marker()
+    assert marker is not None and marker[1] == "face"
+    assert abs(tool.extrusion - 4.0) < 1e-6
+
+    guides = _guide_lines(tool)
+    assert len(guides) == 1 and len(guides[0]) == 3
+    reference, moved, kind = guides[0]
+    assert kind == "face"
+    assert _dist(reference, V(22, 1, 7)) < 1e-6    # the ray∩plane hit
+    assert _dist(moved, tool._anchor + tool._normal * tool.extrusion) < 1e-6
+    assert _dist(moved, V(2, 2, 7)) < 1e-6
