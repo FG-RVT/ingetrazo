@@ -297,6 +297,10 @@ class PushPullTool(Tool):
         # (the BIM-grade guard); _commit surfaces it in the status bar.
         self._refused: bool = False
         self._topped_out: bool = False
+        # One "too small to commit" hint per drag: a click that does nothing
+        # with no word reads as a broken tool, but repeating it on every tiny
+        # click is its own annoyance. Cleared in _reset, so each drag gets one.
+        self._tiny_hint_shown: bool = False
         # ---- Drag preview -----------------------------------------------
         # The drag shows the naive sweep as an overlay — cap plus wall quads,
         # nothing touched in the mesh — and the real pipeline (stitch,
@@ -424,7 +428,13 @@ class PushPullTool(Tool):
 
         # Already dragging — second click commits.
         if abs(self.extrusion) < _MIN_EXTRUDE:
-            # No-op extrusion; just stay in drag mode so the user can keep going.
+            # No-op extrusion; just stay in drag mode so the user can keep
+            # going — but say so once: a click that does nothing with no
+            # word reads as a broken tool.
+            if not self._tiny_hint_shown:
+                viewport.flash_status(tr(
+                    "Too small a push — drag further or type a distance"), 4000)
+                self._tiny_hint_shown = True
             return
         self._commit(viewport)
 
@@ -1747,5 +1757,6 @@ class PushPullTool(Tool):
         self._inference_kind = None
         self._infer_cache = None       # per-drag projected-vertex candidates
         self._refused = False
+        self._tiny_hint_shown = False
         self._light_faces = []
         self._light_rings = []

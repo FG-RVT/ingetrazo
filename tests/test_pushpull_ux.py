@@ -16,7 +16,7 @@ from core.history import AddFaceCommand, History
 from core.orient import is_closed, signed_volume
 from core.scene import Scene
 from tools.base import ToolContext
-from tools.pushpull import PushPullTool
+from tools.pushpull import _MIN_EXTRUDE, PushPullTool
 
 
 def V(x: float, y: float, z: float = 0.0) -> QVector3D:
@@ -1199,3 +1199,101 @@ def test_hovering_an_edge_infers_distance_and_says_on_edge():
     assert d is not None and abs(d - 2.0) < 1e-6
     pt, kind = tool.inference_marker()
     assert kind == "edge" and abs(pt.z() - 5.0) < 1e-6 and abs(pt.x() - 7.0) < 1e-6
+
+
+# ---- Tiny push: a commit click that does nothing says so ----------------------
+
+# Fix 5, "Hint on tiny pushes": mid-drag, a second click with |extrusion| below
+# _MIN_EXTRUDE silently did nothing — the drag stayed alive with no word, and a
+# click that does nothing with no word reads as a broken tool. The status bar
+# flashes ONE hint per drag; the drag itself is unchanged.
+
+_TINY_PUSH_HINT = "Too small a push — drag further or type a distance"
+
+
+def test_tiny_push_flashes_hint_once():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, _MIN_EXTRUDE * 0.5)
+    tool.on_click(_ctx(vp))                 # the tiny "commit"
+    assert vp.last_status == _TINY_PUSH_HINT
+    assert tool.dragging is True            # the drag stays alive
+    assert tool.base_face is top
+    assert abs(tool.extrusion - _MIN_EXTRUDE * 0.5) < 1e-12
+
+
+def test_tiny_push_keeps_drag_alive():
+    # The hint must not disturb the drag: nothing moves, and the SAME drag can
+    # still commit once dragged further. Tiny NEGATIVE here too — |extrusion|
+    # is what matters, not the sign.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    before = _fingerprint(scene)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, -_MIN_EXTRUDE * 0.5)
+    tool.on_click(_ctx(vp))
+    assert vp.last_status == _TINY_PUSH_HINT
+    assert tool.dragging is True
+    assert _fingerprint(scene) == before    # no geometry changed
+    tool.extrusion = 1.5                    # dragged further, still the same drag
+    tool.on_click(_ctx(vp))
+    assert tool.dragging is False           # it committed in the end
+    assert _top(scene, 4.5) is not None
+
+
+def test_second_tiny_click_does_not_reflash():
+    # ONE flash per drag: repeating it on every tiny click is its own
+    # annoyance.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, _MIN_EXTRUDE * 0.5)
+    tool.on_click(_ctx(vp))
+    assert vp.last_status == _TINY_PUSH_HINT
+    vp.last_status = None                   # sentinel: nothing may re-set it
+    tool.on_click(_ctx(vp))                 # still tiny, still the same drag
+    assert vp.last_status is not _TINY_PUSH_HINT
+
+
+def test_new_drag_flashes_again():
+    # The once-limit is per DRAG, not per tool: a fresh drag starts over.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _StubViewport(scene)
+
+    tool = _locked_tool(scene, _top(scene, 3.0), _MIN_EXTRUDE * 0.5)
+    tool.on_click(_ctx(vp))                 # drag 1: tiny click
+    assert vp.last_status == _TINY_PUSH_HINT
+
+    tool.extrusion = 2.0                    # dragged further; commit
+    tool.on_click(_ctx(vp))
+    assert tool.dragging is False
+
+    tool.hovered_face = _top(scene, 5.0)    # drag 2, on the moved top
+    tool.on_click(_ctx(vp))                 # starts the new drag
+    assert tool.dragging is True
+    vp.last_status = None                   # forget drag 1's flash
+    tool.extrusion = _MIN_EXTRUDE * 0.5
+    tool.on_click(_ctx(vp))                 # tiny click in the NEW drag
+    assert vp.last_status == _TINY_PUSH_HINT
+
+
+def test_normal_commit_no_tiny_hint():
+    # A real commit (|extrusion| >= _MIN_EXTRUDE) never says "too small".
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, _top(scene, 3.0), 2.0)
+    tool.on_click(_ctx(vp))
+    assert tool.dragging is False           # it did commit...
+    assert _top(scene, 5.0) is not None
+    assert vp.last_status != _TINY_PUSH_HINT
