@@ -30,6 +30,9 @@ class _StubViewport:
         self._pick = pick
 
     last_status = None
+    # Additive capture of what set_hover was last asked to shade — the
+    # preselection-arm tests read it; nothing existing asserts on it.
+    last_hover = None
 
     def update(self):
         pass
@@ -38,7 +41,7 @@ class _StubViewport:
         self.last_status = text
 
     def set_hover(self, entity):
-        pass
+        self.last_hover = entity
 
     suppressed: set | None = None
 
@@ -1835,3 +1838,198 @@ def test_inference_guide_lines_with_face_inference():
     assert _dist(reference, V(22, 1, 7)) < 1e-6    # the ray∩plane hit
     assert _dist(moved, tool._anchor + tool._normal * tool.extrusion) < 1e-6
     assert _dist(moved, V(2, 2, 7)) < 1e-6
+
+
+# ---- Preselection: Push/Pull arms on the preselected face -----------------------
+#
+# The SketchUp preselection workflow: Push/Pull activated while EXACTLY one
+# Face is selected (and it lives in the loose mesh) arms on it — the face is
+# hover-shaded, idle hovers do NOT steal the arm (no picking under the
+# cursor), and the FIRST CLICK ANYWHERE starts the drag on the armed face,
+# not on whatever sits under the cursor. The arm clears when the drag
+# starts, on Esc/cancel, and when the armed face disappears (undo) the next
+# idle hover falls back to normal picking. A selection that is not exactly
+# one Face (empty, several items, an edge, a Group) arms nothing — today's
+# behaviour.
+
+
+def _front(scene):
+    return next(f for f in scene.faces
+                if len(f.vertices) == 4
+                and all(abs(v.y()) < 1e-9 for v in f.vertices))
+
+
+def test_preselected_face_arms_the_tool():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])                        # the preselection
+
+    vp = _StubViewport(scene)                  # nothing under any cursor
+    tool = PushPullTool()
+    tool.on_activate(vp)
+
+    assert tool.hovered_face is top            # armed, not idle
+    assert tool.dragging is False
+    assert vp.last_hover is top                # the hover shade says it too
+
+
+def test_idle_hover_does_not_steal_the_arm():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])
+    vp = _StubViewport(scene, pick=_front(scene))   # the cursor is over the FRONT
+    tool = PushPullTool()
+    tool.on_activate(vp)
+    assert tool.hovered_face is top
+
+    tool.on_hover(_ctx(vp))                    # an idle frame elsewhere
+
+    assert tool.hovered_face is top            # the arm holds...
+    assert vp.last_hover is top                # ...and so does the shading
+
+
+def test_first_click_anywhere_starts_the_arm_drag():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])
+    vp = _StubViewport(scene)                  # pick=None: empty space
+    tool = PushPullTool()
+    tool.on_activate(vp)
+    assert tool.hovered_face is top
+
+    tool.on_click(_ctx(vp))                    # a click over NOTHING
+
+    assert tool.dragging is True               # the drag started anyway
+    assert tool.base_face is top               # ...on the ARMED face
+
+    tool.extrusion = 2.0
+    tool.on_click(_ctx(vp))                    # the commit click
+    assert _top(scene, 5.0) is not None
+
+    # The arm is spent: the next idle hover picks normally again.
+    vp2 = _StubViewport(scene, pick=_front(scene))
+    tool.on_hover(_ctx(vp2))
+    assert tool.hovered_face is _front(scene)
+
+
+def test_commit_from_armed_start_is_a_normal_push():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])
+    vp = _StubViewport(scene)
+    PushPullTool.last_distance = None
+    tool = PushPullTool()
+    tool.on_activate(vp)
+    tool.on_click(_ctx(vp))                    # the armed start
+    tool.extrusion = 2.0
+    depth = len(vp.history.undo_stack)
+    tool.on_click(_ctx(vp))                    # the commit
+
+    assert _top(scene, 5.0) is not None        # the geometry moved
+    assert len(vp.history.undo_stack) == depth + 1   # exactly one undo step
+    # The distance stays hot: typing right after replaces the push.
+    assert tool.on_value(vp, 3.0) is True
+    assert _top(scene, 6.0) is not None
+    assert not _has_top(scene, 5.0)
+
+
+def test_no_arm_without_single_face_selection():
+    # Only EXACTLY one Face in the loose mesh arms: nothing, two faces, an
+    # edge, a Group — each leaves the tool unarmed, today's behaviour.
+
+    # (a) nothing selected
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    tool = PushPullTool()
+    tool.on_activate(_StubViewport(scene))
+    assert tool.hovered_face is None
+
+    # (b) two faces selected
+    scene.select([_top(scene, 3.0), _front(scene)])
+    tool = PushPullTool()
+    tool.on_activate(_StubViewport(scene))
+    assert tool.hovered_face is None
+
+    # (c) an edge selected
+    scene2 = Scene()
+    hist2 = History(scene2)
+    _cube(scene2, hist2, height=3.0)
+    scene2.select([scene2.mesh.edges[0]])
+    tool = PushPullTool()
+    tool.on_activate(_StubViewport(scene2))
+    assert tool.hovered_face is None
+
+    # (d) a Group selected
+    g = _boxed_group(scene2)
+    scene2.select([g])
+    tool = PushPullTool()
+    tool.on_activate(_StubViewport(scene2))
+    assert tool.hovered_face is None
+
+
+def test_esc_drops_the_arm():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])
+    vp = _StubViewport(scene)
+    tool = PushPullTool()
+    tool.on_activate(vp)
+    assert tool.hovered_face is top
+
+    tool.on_cancel(vp)                         # Esc
+
+    assert tool.hovered_face is None           # the arm is gone
+    tool.on_click(_ctx(vp))                    # no hover pick under the cursor
+    assert tool.dragging is False              # ...so the click does nothing
+
+
+def test_dead_armed_face_falls_back():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    scene.select([top])
+    vp = _StubViewport(scene)
+    tool = PushPullTool()
+    tool.on_activate(vp)
+    assert tool.hovered_face is top
+
+    scene.mesh.remove_face(top)                # undo took the armed face away
+
+    front = _front(scene)
+    vp2 = _StubViewport(scene, pick=front)
+    tool.on_hover(_ctx(vp2))                   # the next idle hover
+
+    assert tool.dragging is False              # no crash
+    assert tool.hovered_face is front          # a fresh pick, the arm dropped
+
+
+def test_activate_with_no_selection_unchanged():
+    # Regression: without a preselection, on_activate leaves the tool idle
+    # and the hover+click rhythm works exactly as before.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene, pick=top)
+    tool = PushPullTool()
+    tool.on_activate(vp)
+
+    assert tool.hovered_face is None
+
+    tool.on_hover(_ctx(vp))
+    assert tool.hovered_face is top
+    tool.on_click(_ctx(vp))
+    assert tool.dragging is True
+    assert tool.base_face is top

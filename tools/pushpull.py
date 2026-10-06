@@ -46,6 +46,10 @@ from PySide6.QtWidgets import QApplication
 from core.geometry import Face
 from core.i18n import tr
 from core.mesh import PAINT_KEYS
+# MeshFace is core.mesh's Face — the class scene meshes are built from. The
+# geometry.Face imported above is a DIFFERENT legacy class; an isinstance
+# against IT is always False, so the preselection arm checks MeshFace.
+from core.mesh import Face as MeshFace
 from core.history import (
     AddEdgeCommand,
     AddFaceCommand,
@@ -279,6 +283,14 @@ class PushPullTool(Tool):
         # pushable. See _refuse_closed_group.
         self._group = None
         self._hover_group = None
+        # The preselection arm: activated with EXACTLY one loose-mesh Face
+        # selected, the tool locks onto it (the SketchUp workflow) — the
+        # hover shade goes up at once, idle hovers do not steal it, and the
+        # first click ANYWHERE starts the drag on it. Disarms when a drag
+        # starts, on _reset (Esc, deactivate, commit), and when the armed
+        # face is no longer in the mesh (undo) — the next idle hover then
+        # picks normally again.
+        self._selected_arm: bool = False
         # Whether the base face is embedded in a solid (its boundary edges are
         # shared), so an inner face pushed in is a recess (window/door pocket).
         self._attached: bool = False
@@ -345,6 +357,24 @@ class PushPullTool(Tool):
     # ---- Lifecycle ----------------------------------------------------------
     def on_activate(self, viewport) -> None:
         self._reset()
+        # The SketchUp preselection workflow: activated with EXACTLY one
+        # Face of the loose mesh selected, the tool arms on it — the first
+        # click anywhere starts the drag there, not on whatever sits under
+        # the cursor. Anything else (nothing, several items, an edge, a
+        # group) leaves the tool idle, as before.
+        sel = viewport.scene.selection
+        if len(sel) != 1:
+            return
+        item = next(iter(sel))
+        # MeshFace, not the geometry.Face imported at top: the mesh's Face
+        # and the legacy one are different classes, and the loose mesh only
+        # ever holds the former.
+        if not isinstance(item, MeshFace) or item not in viewport.scene.mesh.faces:
+            return
+        self.hovered_face = item
+        self._hover_group = None
+        self._selected_arm = True
+        viewport.set_hover(item)
 
     def on_deactivate(self, viewport) -> None:
         self._revert_preview(viewport)
@@ -382,6 +412,14 @@ class PushPullTool(Tool):
         if not self.dragging:
             self._inference_point = None
             self._inference_kind = None
+            # The armed preselection outranks the cursor: an idle frame
+            # elsewhere must not steal it. A face gone from the mesh (undo
+            # took it) disarms and falls through to a normal pick.
+            if self._selected_arm and self.hovered_face is not None:
+                if self.hovered_face in viewport.scene.mesh.faces:
+                    viewport.set_hover(self.hovered_face)
+                    return
+                self._selected_arm = False
             self.hovered_face, self._hover_group = viewport.pick_face_any(
                 ctx.screen.x(), ctx.screen.y())
             # Shade the face that would be pushed, so the target
@@ -442,6 +480,7 @@ class PushPullTool(Tool):
             # second beat, not a stroke.
             self._press_screen = (ctx.screen.x(), ctx.screen.y())
             self._last_screen = self._press_screen
+            self._selected_arm = False  # a drag exists; the arm is spent
             target = self._target_scene(viewport.scene)
             # Establish the outward invariant ONCE per drag, before anchor and
             # normal are captured. The preview restores its own snapshot (taken
@@ -508,6 +547,7 @@ class PushPullTool(Tool):
             self._prism_verts = self._cap_vertices(target)
             self._compute_inward_limit(target)
             self._preview_snapshot = None
+            self._selected_arm = False  # never armed once a drag exists
         elif abs(self.extrusion) > _MIN_EXTRUDE:
             # Mid-drag with a real distance: treat as the commit click.
             self._commit(viewport)
@@ -1902,6 +1942,7 @@ class PushPullTool(Tool):
         self._limit_in = None
         self._group = None
         self._hover_group = None
+        self._selected_arm = False
         self._anchor = None
         self._normal = None
         self._cap_positions = []
