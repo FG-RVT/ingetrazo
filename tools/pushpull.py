@@ -313,6 +313,18 @@ class PushPullTool(Tool):
         # The sweep's rings, ``[(base_ring, moved_ring), …]`` (outer first,
         # then holes) — the wireframe is drawn straight off them.
         self._light_rings: list = []
+        # ---- Hot retype ------------------------------------------------------
+        # The just-committed push, adjustable by typing (on_value): typing a
+        # distance undoes that one command and re-commits the push at the
+        # typed TOTAL distance — positive keeps the committed direction,
+        # negative reverses it — leaving ONE undo step however many retypes.
+        # Holds the drag state _commit consumed (the mesh restore is
+        # identity-preserving, so the Face object comes back valid), the
+        # command that must sit on the undo stack's top, and the committed
+        # direction's sign. Armed only where a push actually landed; a
+        # click, Esc, a tool change or the user's own undo closes it — the
+        # same window contract Rotate already has (tools/rotate.py).
+        self._last: dict | None = None
 
     # ---- Lifecycle ----------------------------------------------------------
     def on_activate(self, viewport) -> None:
@@ -392,6 +404,7 @@ class PushPullTool(Tool):
 
     def on_click(self, ctx: ToolContext) -> None:
         viewport = ctx.viewport
+        self._last = None            # a click ends the retype window
         self._keep_base = bool(ctx.modifiers & Qt.ControlModifier)
         if not self.dragging:
             face = self.hovered_face
@@ -482,13 +495,55 @@ class PushPullTool(Tool):
         # Push/Pull only takes a single extrusion length; 3D deltas don't apply.
         if isinstance(value, tuple):
             return False
-        if not self.dragging or self.base_face is None or value == 0.0:
+        if self.dragging and self.base_face is not None:
+            if value == 0.0:
+                return False
+            # A positive value goes the way the user is dragging (default
+            # +normal); a negative one reverses it.
+            sign = -1.0 if self.extrusion < 0.0 else 1.0
+            self.extrusion = sign * value
+            self._clamp_extrusion(viewport)
+            self._commit(viewport)
+            return True
+        # Idle: the hot retype — adjust the last push by typing. The typed
+        # distance is the TOTAL from the base: positive keeps the committed
+        # direction, negative reverses it ("sign" * value). Only the command
+        # this tool just committed may be replaced; anything else on top
+        # means the user's history moved on and the window is gone.
+        last = self._last
+        if last is None or value == 0.0:
             return False
-        # A positive value goes the way the user is dragging (default +normal);
-        # a negative one reverses it.
-        sign = -1.0 if self.extrusion < 0.0 else 1.0
-        self.extrusion = sign * value
+        stack = getattr(viewport.history, "undo_stack", None)
+        if not stack or stack[-1] is not last["cmd"]:
+            self._last = None
+            return False
+        viewport.history.undo()
+        # Replay the push as a drag at the typed distance: restore the state
+        # _commit cleared, neutralize the preview bookkeeping, then commit.
+        # _anchor/_attached/_prism_verts stay cleared — the commit path
+        # never reads them.
+        self.base_face = last["face"]
+        self._group = last["group"]
+        self._keep_base = last["keep_base"]
+        self._prism_cap = last["prism_cap"]
+        self._normal = last["normal"]
+        self._cap_positions = last["cap_positions"]
+        self._drag_pre_oriented = last["pre_oriented"]
+        self._limit_in = last["limit_in"]
+        self.dragging = True
+        self.extrusion = 0.0
+        self._preview_snapshot = None
+        self._prism_applied = 0.0
+        self._prism_verts = []
+        self._light_faces = []
+        self._light_rings = []
+        self._infer_cache = None
+        self._refused = False
+        self._topped_out = False
+        self.extrusion = last["sign"] * value
         self._clamp_extrusion(viewport)
+        # Re-arms the window where the replay landed (success or top-out);
+        # a refusal or a too-tiny value leaves it closed.
         self._commit(viewport)
         return True
 
@@ -1164,14 +1219,21 @@ class PushPullTool(Tool):
         # and it is the identical mutation the live preview just showed. A push
         # aimed at a group snapshots that group's mesh instead.
         self._topped_out = False
-        viewport.history.execute(SnapshotMutation(
+        cmd = SnapshotMutation(
             self._mutate_or_top_out,
-            mesh=self._group.mesh if self._group is not None else None))
+            mesh=self._group.mesh if self._group is not None else None)
+        viewport.history.execute(cmd)
+        # The retype window's payload, captured BEFORE _reset clears the drag
+        # state (the sign is the direction actually committed — the reduced
+        # distance on a top-out). Armed only where a push landed: a refusal
+        # left the mesh untouched, so there is nothing to retype.
+        last = None
         if self._topped_out:
             viewport.flash_status(tr(
                 "Push stopped at {d}: going further would break the "
                 "solid", d=fmt_len(abs(self.extrusion))), 4000)
             PushPullTool.last_distance = self.extrusion
+            last = self._retype_state(cmd)
         elif self._refused:
             # The guard rolled the push back to keep the solid watertight; tell
             # the user so the no-op isn't silent — long timeout, it's easy to
@@ -1181,8 +1243,31 @@ class PushPullTool(Tool):
                 6000)
         else:
             PushPullTool.last_distance = self.extrusion  # double-click repeats it
+            last = self._retype_state(cmd)
         self._reset()
+        self._last = last             # arms the retype window, if one opened
         viewport.update()
+
+    def _retype_state(self, cmd) -> dict:
+        """The ``_last`` payload: everything a hot retype (on_value, tool
+        idle) needs to replay the push _commit is about to finish — the drag
+        state _reset clears next line, plus the command to beat on the undo
+        stack's top. See the ``_last`` declaration for the window contract."""
+        return {
+            "cmd": cmd,
+            "face": self.base_face,
+            "group": self._group,
+            "keep_base": self._keep_base,
+            "prism_cap": self._prism_cap,
+            # _normal can be None on a directly-driven commit (tests); the
+            # replay falls back to the face's own, exactly as the original.
+            "normal": (None if self._normal is None
+                       else QVector3D(self._normal)),
+            "cap_positions": list(self._cap_positions),
+            "pre_oriented": self._drag_pre_oriented,
+            "limit_in": self._limit_in,
+            "sign": 1.0 if self.extrusion >= 0.0 else -1.0,
+        }
 
     #: How many halvings the commit tries when the guard refuses the distance
     #: the user dragged to. Each costs a full pipeline run, so this buys a
@@ -1760,3 +1845,4 @@ class PushPullTool(Tool):
         self._tiny_hint_shown = False
         self._light_faces = []
         self._light_rings = []
+        self._last = None             # the retype window closes with the drag

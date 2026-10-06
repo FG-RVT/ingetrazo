@@ -1297,3 +1297,190 @@ def test_normal_commit_no_tiny_hint():
     assert tool.dragging is False           # it did commit...
     assert _top(scene, 5.0) is not None
     assert vp.last_status != _TINY_PUSH_HINT
+
+
+# ---- Hot retype: adjust the last push by typing --------------------------------
+#
+# Fix 2: right after a Push/Pull commit the distance stays hot — typing a
+# number + Enter in the Measurements box REPLACES the committed distance (the
+# push is undone and re-committed at the typed value; a positive keeps the
+# committed direction, a negative reverses it), and the undo history holds
+# exactly ONE step for the push however many retypes. The window closes at a
+# click that starts a new drag, Esc, or the user's own undo — the contract
+# Rotate already has (test_hot_retype_redoes_the_rotation).
+
+
+def _has_top(scene, z):
+    # ``_top`` raises when no face sits at z; the retype tests also need to
+    # say "the old cap is GONE".
+    return any(len(f.vertices) == 4
+               and all(abs(v.z() - z) < 1e-9 for v in f.vertices)
+               for f in scene.faces)
+
+
+def test_hot_retype_replaces_the_last_push():
+    # Commit +2, then type 3: the push is redone at 3 — the stack entry is
+    # replaced, not stacked on (the rotate convention).
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    PushPullTool.last_distance = None
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))                    # the commit: +2.0
+    assert tool.dragging is False
+    assert _top(scene, 5.0) is not None
+    depth = len(vp.history.undo_stack)
+
+    assert tool.on_value(vp, 3.0) is True      # retype: 3.0 instead of 2.0
+    assert _top(scene, 6.0) is not None        # base + 3.0
+    assert not _has_top(scene, 5.0)            # the 2.0 push is gone
+    assert len(vp.history.undo_stack) == depth     # replaced, not stacked
+    assert PushPullTool.last_distance == 3.0
+
+
+def test_hot_retype_negative_reverses_the_push():
+    # A typed negative flips the side: +2 committed upward, "-3" lands 3 INTO
+    # the solid. A tall cube, so the reversed push stays clear of the
+    # collapse-at-the-floor limit.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=4.0)
+    top = _top(scene, 4.0)
+    vp = _StubViewport(scene)
+    PushPullTool.last_distance = None
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))                    # top now at 6.0
+    assert _top(scene, 6.0) is not None
+
+    assert tool.on_value(vp, -3.0) is True     # 3.0 the OTHER way
+    assert _top(scene, 1.0) is not None        # 4.0 − 3.0
+    assert not _has_top(scene, 6.0)
+    assert PushPullTool.last_distance == -3.0
+
+
+def test_retype_of_retype_keeps_one_undo_step():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    PushPullTool.last_distance = None
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))
+    depth = len(vp.history.undo_stack)
+
+    assert tool.on_value(vp, 3.0) is True
+    assert tool.on_value(vp, 4.0) is True      # and again
+    assert _top(scene, 7.0) is not None        # 3.0 + 4.0
+    assert len(vp.history.undo_stack) == depth     # still ONE step for the push
+    assert PushPullTool.last_distance == 4.0
+
+
+def test_a_click_closes_the_retype_window():
+    # A click that starts a NEW drag owns the Measurements box again: the
+    # typed number commits that drag (the mid-drag semantics), it does not
+    # adjust the old push.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))                    # +2.0, top at 5.0
+    depth = len(vp.history.undo_stack)
+
+    tool.hovered_face = _top(scene, 5.0)       # a fresh click, a new drag
+    tool.on_click(_ctx(vp))
+    assert tool.dragging is True
+
+    assert tool.on_value(vp, 3.0) is True      # commits the NEW drag at 3.0
+    assert tool.dragging is False
+    assert _top(scene, 8.0) is not None        # 3 + 2 + 3: both pushes stand
+    # a second entry landed — the new push, not a retype of the first
+    assert len(vp.history.undo_stack) == depth + 1
+
+
+def test_esc_closes_the_retype_window():
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))
+    before = _fingerprint(scene)
+
+    tool.on_cancel(vp)
+    assert tool.on_value(vp, 3.0) is False
+    assert _fingerprint(scene) == before       # the push stands, untouched
+
+
+def test_user_undo_closes_the_retype_window():
+    # The user's own undo pops the push off the stack top: a retype has
+    # nothing left to replace.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))
+
+    assert vp.history.undo() is True           # the user undoes the push
+    assert tool.on_value(vp, 3.0) is False
+    assert _top(scene, 3.0) is not None        # still undone, not redone
+    assert not _has_top(scene, 5.0)
+
+
+def test_one_undo_after_retype_returns_to_before_the_push():
+    # However many retypes, ONE undo steps back over all of them: back to
+    # the plain cube, not to an intermediate distance.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    before = _fingerprint(scene)
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))
+    assert tool.on_value(vp, 3.0) is True
+    assert _top(scene, 6.0) is not None
+
+    assert vp.history.undo() is True           # ONE undo, through the retype
+    assert _fingerprint(scene) == before       # the pre-push cube, exactly
+    assert _top(scene, 3.0) is not None
+
+
+def test_typing_mid_drag_still_commits_the_typed_distance():
+    # Regression, the pre-existing semantics: typing DURING a drag commits
+    # the drag at the typed distance, keeping the drag's sign.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, _top(scene, 3.0), 0.5)
+
+    assert tool.on_value(vp, 2.0) is True
+    assert tool.dragging is False
+    assert _top(scene, 5.0) is not None        # 3 + 2.0, not 3 + 0.5
+
+
+def test_retype_window_takes_no_tuple_and_no_zero():
+    # A 3D delta is not a push distance, and 0 would collapse the solid:
+    # both are refused, and neither adjusts anything.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _StubViewport(scene)
+    tool = _locked_tool(scene, top, 2.0)
+    tool.on_click(_ctx(vp))
+    before = _fingerprint(scene)
+    depth = len(vp.history.undo_stack)
+
+    assert tool.on_value(vp, (1.0, 2.0, 3.0)) is False   # a 3D delta
+    assert tool.on_value(vp, 0.0) is False               # no adjust to zero
+    assert _fingerprint(scene) == before
+    assert len(vp.history.undo_stack) == depth
