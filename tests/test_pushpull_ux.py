@@ -1484,3 +1484,197 @@ def test_retype_window_takes_no_tuple_and_no_zero():
     assert tool.on_value(vp, 0.0) is False               # no adjust to zero
     assert _fingerprint(scene) == before
     assert len(vp.history.undo_stack) == depth
+
+
+# ---- Press-drag-release commits the push --------------------------------------
+#
+# Fix 1: releasing the left button mid-drag commits the push WHEN the gesture
+# was a real drag — >= ~6 px of screen motion from the press AND an extrusion
+# of at least _MIN_EXTRUDE. A release with no real motion does nothing, so
+# the click-click rhythm keeps working; motion that built no push flashes the
+# tiny-push hint once per drag; a release after Esc — or trailing any commit —
+# is a no-op. Driven through the tool's own on_click/on_hover/on_release, with
+# a stub viewport whose lock-line projection turns pixels into extrusion.
+
+#: Below this many pixels between press and release, the gesture is a click.
+_DRAG_MOTION_PX = 6.0
+
+
+def _px(vp, x, y, modifiers=Qt.NoModifier):
+    """A context whose screen point is the REAL pixel — a press or a hover
+    frame at (x, y)."""
+    return ToolContext(viewport=vp, world=QVector3D(), screen=QPointF(x, y),
+                       modifiers=modifiers, snap=None)
+
+
+class _DragViewport(_StubViewport):
+    """Stub whose lock-line projection maps horizontal screen motion to
+    extrusion: the cursor at (100 + 10*k, 100) reads as a push of k/10 m
+    along the drag's normal. Vertical motion maps to nothing."""
+
+    snap_threshold_px = 9.0
+
+    def _world_to_pixel(self, world):
+        return (world.x() * 10.0, -world.z() * 10.0)
+
+    def _project_to_lock_line(self, start, direction, px, py):
+        d = QVector3D(direction).normalized()
+        return QVector3D(start) + d * ((px - 100.0) / 100.0)
+
+
+class _FlatDragViewport(_StubViewport):
+    """The cursor crosses the screen, but the projection lands every pixel
+    BESIDE the push axis: plenty of motion, ~0 extrusion."""
+
+    snap_threshold_px = 9.0
+
+    def _world_to_pixel(self, world):
+        return (world.x() * 10.0, -world.z() * 10.0)
+
+    def _project_to_lock_line(self, start, direction, px, py):
+        d = QVector3D(direction).normalized()
+        side = QVector3D.crossProduct(d, QVector3D(1.0, 0.0, 0.0))
+        if side.length() < 1e-6:
+            side = QVector3D(0.0, 1.0, 0.0)
+        return QVector3D(start) + side.normalized() * ((px - 100.0) / 100.0)
+
+
+def _pressed_tool(scene, vp, px=100.0, py=100.0):
+    """A drag started the way the gesture starts it: hover preset, on_click
+    carrying the press pixel."""
+    tool = PushPullTool()
+    tool.hovered_face = _top(scene, 3.0)
+    tool.on_click(_px(vp, px, py))
+    assert tool.dragging is True
+    return tool
+
+
+def test_release_after_real_drag_commits():
+    # Rule 1: 50 px of real motion building a +0.5 m push — the release
+    # commits it (one undo step) and leaves the distance HOT: typing right
+    # after replaces the committed push.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _DragViewport(scene)
+    PushPullTool.last_distance = None
+    tool = _pressed_tool(scene, vp)
+    tool.on_hover(_px(vp, 150.0, 100.0))
+    assert abs(tool.extrusion - 0.5) < 1e-9       # the harness reads the drag
+    depth = len(vp.history.undo_stack)
+
+    tool.on_release(vp)                           # release mid-drag commits
+
+    assert tool.dragging is False
+    assert _top(scene, 3.5) is not None           # the geometry moved
+    assert len(vp.history.undo_stack) == depth + 1  # exactly one undo step
+    # Hot retype is armed by the release-commit, same as a click-commit.
+    assert tool.on_value(vp, 3.0) is True
+    assert _top(scene, 6.0) is not None
+    assert not _has_top(scene, 3.5)               # replaced, not stacked
+    assert len(vp.history.undo_stack) == depth + 1
+
+
+def test_release_without_motion_keeps_dragging():
+    # Rule 2: the release lands on the press pixel — no motion, no commit,
+    # and the click-click rhythm still works afterwards.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    top = _top(scene, 3.0)
+    vp = _DragViewport(scene)
+    tool = _pressed_tool(scene, vp)
+    tool.on_release(vp)
+
+    assert tool.dragging is True                  # nothing happened
+    assert tool.base_face is top
+    assert len(vp.history.undo_stack) == 0
+
+    tool.on_hover(_px(vp, 150.0, 100.0))          # drag further, then...
+    tool.on_click(_px(vp, 150.0, 100.0))          # ...the second click commits
+    assert tool.dragging is False
+    assert _top(scene, 3.5) is not None
+
+
+def test_release_with_jitter_only_does_not_commit():
+    # Rule 2: a ~3 px wobble is not a drag — even though each jitter frame
+    # builds extrusion enough to commit by distance alone, the MOTION gate
+    # holds it: still dragging, nothing committed, nothing said.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _DragViewport(scene)
+    tool = _pressed_tool(scene, vp)
+    for x, y in ((102.0, 100.0), (100.0, 102.0), (98.0, 99.0)):
+        tool.on_hover(_px(vp, x, y))
+    assert abs(tool.extrusion) >= _MIN_EXTRUDE    # distance alone would commit
+    tool.on_release(vp)
+
+    assert tool.dragging is True
+    assert len(vp.history.undo_stack) == 0
+    assert vp.last_status is not _TINY_PUSH_HINT  # no motion, no hint either
+
+
+def test_release_with_motion_but_tiny_extrusion_hints():
+    # Rule 3: 70 px of motion that built no push — the release flashes the
+    # tiny-push hint ONCE and keeps the drag alive.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _FlatDragViewport(scene)
+    tool = _pressed_tool(scene, vp)
+    tool.on_hover(_px(vp, 170.0, 100.0))
+    assert abs(tool.extrusion) < _MIN_EXTRUDE     # motion, but no push
+    tool.on_release(vp)
+
+    assert vp.last_status == _TINY_PUSH_HINT
+    assert tool.dragging is True
+    assert len(vp.history.undo_stack) == 0
+
+    vp.last_status = None                         # sentinel
+    tool.on_hover(_px(vp, 220.0, 100.0))
+    tool.on_release(vp)                           # still tiny, same drag
+    assert vp.last_status is not _TINY_PUSH_HINT  # once per drag only
+    assert tool.dragging is True
+
+
+def test_release_after_cancel_is_a_no_op():
+    # Rule 4: Esc already cancelled the drag; the button coming up afterwards
+    # must not commit anything.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _DragViewport(scene)
+    tool = _pressed_tool(scene, vp)
+    tool.on_hover(_px(vp, 150.0, 100.0))
+    tool.on_cancel(vp)
+    assert tool.dragging is False
+    before = _fingerprint(scene)
+
+    tool.on_release(vp)
+
+    assert _fingerprint(scene) == before
+    assert tool.dragging is False
+    assert len(vp.history.undo_stack) == 0
+
+
+def test_trailing_release_after_double_click_commit_is_no_op():
+    # Rule 5: a quick click-click commits; the release trailing that commit
+    # click must not commit again.
+    scene = Scene()
+    hist = History(scene)
+    _cube(scene, hist, height=3.0)
+    vp = _DragViewport(scene)
+    tool = _pressed_tool(scene, vp)
+    tool.on_hover(_px(vp, 150.0, 100.0))
+    tool.on_click(_px(vp, 150.0, 100.0))          # the commit click
+    assert tool.dragging is False
+    assert _top(scene, 3.5) is not None
+    depth = len(vp.history.undo_stack)
+    before = _fingerprint(scene)
+
+    tool.on_release(vp)                           # its trailing release
+
+    assert len(vp.history.undo_stack) == depth    # no double commit
+    assert _fingerprint(scene) == before
+    assert tool.dragging is False

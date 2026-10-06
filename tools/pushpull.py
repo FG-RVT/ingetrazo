@@ -37,8 +37,11 @@ as the cap of the new box.
 """
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QVector3D
+from PySide6.QtWidgets import QApplication
 
 from core.geometry import Face
 from core.i18n import tr
@@ -172,6 +175,12 @@ def _swept_by_push(neighbour: Face, push_normal: QVector3D) -> bool:
 # vertex-by-vertex and degenerate the wall quads. Treated as a no-op push.
 _MIN_EXTRUDE = 2e-4
 
+#: Below this many pixels between press and release, the "drag" was a
+#: jittery click, not a stroke: the release belongs to the click-click
+#: rhythm and must not commit. Same release-vs-click disambiguation as
+#: Follow Me (tools/followme.py), same threshold.
+_DRAG_PX = 6.0
+
 
 
 
@@ -301,6 +310,13 @@ class PushPullTool(Tool):
         # with no word reads as a broken tool, but repeating it on every tiny
         # click is its own annoyance. Cleared in _reset, so each drag gets one.
         self._tiny_hint_shown: bool = False
+        # ---- Press-drag-release --------------------------------------------
+        # Where the press landed and where the cursor is now (screen px):
+        # the release compares the two to tell a stroke from a jittery click.
+        # Drags armed without a real press — the hot-retype replay, the test
+        # harness — leave both None, and on_release copes by doing nothing.
+        self._press_screen: tuple | None = None
+        self._last_screen: tuple | None = None
         # ---- Drag preview -----------------------------------------------
         # The drag shows the naive sweep as an overlay — cap plus wall quads,
         # nothing touched in the mesh — and the real pipeline (stitch,
@@ -376,6 +392,10 @@ class PushPullTool(Tool):
                                else self.hovered_face)
             return
 
+        # Tracked before any guard: the release's "was this a stroke" test
+        # must know where the cursor is even when the anchor state is not
+        # ready to measure an extrusion yet.
+        self._last_screen = (ctx.screen.x(), ctx.screen.y())
         if self.base_face is None or self._anchor is None:
             return
         # Ctrl can be pressed/released mid-drag; the live preview follows.
@@ -417,6 +437,11 @@ class PushPullTool(Tool):
             self.extrusion = 0.0
             self.dragging = True
             self._group = self._hover_group
+            # The press pixel: a release far enough from it commits
+            # (on_release); one on the spot is the click-click rhythm's own
+            # second beat, not a stroke.
+            self._press_screen = (ctx.screen.x(), ctx.screen.y())
+            self._last_screen = self._press_screen
             target = self._target_scene(viewport.scene)
             # Establish the outward invariant ONCE per drag, before anchor and
             # normal are captured. The preview restores its own snapshot (taken
@@ -489,6 +514,38 @@ class PushPullTool(Tool):
             return
         self.extrusion = last
         self._clamp_extrusion(viewport)
+        self._commit(viewport)
+
+    def on_release(self, viewport) -> None:
+        """Left button up mid-drag: a press-drag-release stroke commits the
+        push at the distance the drag built — the way every drag tool ends.
+
+        The contract mirrors Follow Me (tools/followme.py): only a release
+        that moved ``_DRAG_PX`` from the press is a stroke. A stationary or
+        jittery release is the starting click's own and leaves the drag
+        open, so the click-click rhythm still works; a release trailing a
+        commit, an Esc or a tool change finds ``dragging`` False and does
+        nothing."""
+        if not self.dragging:
+            return
+        a, b = self._press_screen, self._last_screen
+        if a is None or b is None:
+            return          # drag armed without a real press (retype replay)
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < _DRAG_PX:
+            return          # jitter, not a stroke: never a commit
+        # Ctrl re-read LIVE: the copy decision is the user's at the release,
+        # not whatever the press carried.
+        self._keep_base = bool(
+            QApplication.queryKeyboardModifiers() & Qt.ControlModifier)
+        if abs(self.extrusion) < _MIN_EXTRUDE:
+            if not self._tiny_hint_shown:
+                viewport.flash_status(tr(
+                    "Too small a push — drag further or type a distance"), 4000)
+                self._tiny_hint_shown = True
+            return
+        # The VCB buffer is NOT cleared here, deliberately: typing mid-drag
+        # + release + Enter lands as the hot retype (only _dispatch_tool_click
+        # clears it).
         self._commit(viewport)
 
     def on_value(self, viewport, value) -> bool:
@@ -1843,6 +1900,8 @@ class PushPullTool(Tool):
         self._infer_cache = None       # per-drag projected-vertex candidates
         self._refused = False
         self._tiny_hint_shown = False
+        self._press_screen = None
+        self._last_screen = None
         self._light_faces = []
         self._light_rings = []
         self._last = None             # the retype window closes with the drag
