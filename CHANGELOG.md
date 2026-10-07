@@ -6,6 +6,27 @@ follow [SemVer](https://semver.org).
 
 ## [Sin publicar]
 
+### Añadido
+- **Empujar responde al gesto completo**: soltar el botón después de
+  arrastrar confirma la extrusión, como en las herramientas clásicas, y el
+  ritmo clic-clic de siempre sigue intacto; Ctrl (empujar una copia) se lee
+  en el instante exacto de soltar. Cuando la distancia es demasiado pequeña,
+  el intento de confirmar —clic o soltada— avisa una vez por arrastre
+  («Empuje demasiado pequeño — arrastra más o escribe una distancia») en vez
+  de no hacer nada en silencio.
+- **La distancia sigue caliente tras confirmar**: teclear un número y Enter
+  justo después de un empuje lo sustituye — positivo mantiene el sentido,
+  negativo lo invierte — y la operación sigue ocupando un solo paso de
+  deshacer por muchos retipados, el mismo contrato que Rotar y Escalar.
+- **La línea de referencia, a la vista**: durante el arrastre, una línea
+  discontinua del color de su inferencia (verde = vértice, rojo = arista,
+  azul = cara) une el punto de referencia con la tapa que se mueve: se ve
+  por qué la distancia se detiene donde se detiene.
+- **Empujar arranca sobre la cara seleccionada**: con una sola cara
+  seleccionada, activar Push/Pull (P) la deja lista — sombreada, sin que
+  pasar el cursor por otra se la robe — y el primer clic, caiga donde
+  caiga, arranca el empuje sobre ella: el flujo clásico de preselección.
+
 ### Rendimiento
 - **Orbitar un modelo con miles de componentes es 11× más fluido**: con la
   planta industrial de la #158 (21 406 copias) cada cuadro pasaba de 1,3 s
